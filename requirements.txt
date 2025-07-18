@@ -1,0 +1,6 @@
+librosa
+noisereduce
+pydub
+openai-whisper
+pyannote.audio
+torch 
