@@ -3,6 +3,8 @@ env/
 .env
 # Ignore audio files
 *.wav
+*.pth
+*.json
 
 # Ignore processed data
 processed_data/

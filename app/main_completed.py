@@ -1,7 +1,5 @@
 # main.py
 
-# -*- coding: utf-8 -*-
-# Existing imports
 import wave
 import librosa
 import noisereduce as nr
@@ -13,10 +11,7 @@ from pyannote.audio import Pipeline
 from pyannote.core import Segment
 import torch
 from dotenv import load_dotenv
-from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
-
-# New import for HTTP requests to TTS service
-import requests
+from TTS.api import Synthesizer
 
 # Load environment variables from .env file
 load_dotenv()
@@ -123,42 +118,38 @@ class SpeechToTextConverter:
     def __init__(self, preprocessed_data, sample_rate):
         self.preprocessed_data = preprocessed_data
         self.sample_rate = sample_rate
-
-        # Whisper for timestamp segmentation
         self.whisper_model = whisper.load_model("medium")
-
-        # Wav2Vec2 for accurate Persian transcription
-        self.processor = Wav2Vec2Processor.from_pretrained("jonatasgrosman/wav2vec2-large-xlsr-53-persian")
-        self.wav2vec_model = Wav2Vec2ForCTC.from_pretrained("jonatasgrosman/wav2vec2-large-xlsr-53-persian")
-
-        # PyAnnote speaker diarization
         self.diarization_pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
             use_auth_token=os.getenv("PYANNOTE_API_KEY")
         )
 
     def convert(self):
-        # Normalize to [-1, 1]
+        # Ensure preprocessed_data is a numpy array and normalize to [-1, 1]
         audio_data = np.array(self.preprocessed_data, dtype=np.float32) / 32768.0
 
-        # Step 1: Use Whisper only for timestamped segments
-        result = self.whisper_model.transcribe(audio_data, word_timestamps=True, language="fa")
+        # Specify Persian as the language for transcription
+        language_code = "fa"  # Persian language code
+
+        # Convert speech to text using Whisper with word timestamps and specified language
+        result = self.whisper_model.transcribe(audio_data, word_timestamps=True, language=language_code)
         transcript_segments = result['segments']
 
-        # Step 2: Prepare audio input for PyAnnote
+        # Prepare audio input for PyAnnote
         audio_input = {
-            "waveform": torch.from_numpy(audio_data).unsqueeze(0),
+            "waveform": torch.from_numpy(audio_data).unsqueeze(0),  # Add batch dimension
             "sample_rate": self.sample_rate
         }
 
+        # Perform speaker diarization using PyAnnote
         diarization = self.diarization_pipeline(audio_input)
 
-        # Step 3: Replace Whisper transcript with Wav2Vec2
-        conversation = self.assign_speakers(transcript_segments, diarization, audio_data)
+        # Integrate text and speaker labels
+        conversation = self.assign_speakers(transcript_segments, diarization)
 
         return "\n".join(conversation)
 
-    def assign_speakers(self, transcript_segments, diarization, full_audio, min_overlap_sec=0.7):
+    def assign_speakers(self, transcript_segments, diarization, min_overlap_sec=0.7):
         annotated_transcript = []
         for segment in transcript_segments:
             start = segment['start']
@@ -167,33 +158,34 @@ class SpeechToTextConverter:
             segment_range = Segment(start, end)
 
             for turn, _, speaker in diarization.itertracks(yield_label=True):
-                intersection = turn & segment_range
+                # Calculate intersection segment
+                intersection = turn & segment_range  # intersection is a Segment or None
                 if intersection and intersection.duration > min_overlap_sec:
                     speaker_label = speaker
                     break
 
-            # Slice audio chunk
-            start_sample = int(start * self.sample_rate)
-            end_sample = int(end * self.sample_rate)
-            chunk = full_audio[start_sample:end_sample]
-
-            if len(chunk) == 0:
-                continue
-
-            # Transcribe with Wav2Vec2
-            inputs = self.processor(chunk, sampling_rate=self.sample_rate, return_tensors="pt", padding=True)
-            with torch.no_grad():
-                logits = self.wav2vec_model(**inputs).logits
-                pred_ids = torch.argmax(logits, dim=-1)
-                transcription = self.processor.decode(pred_ids[0]).strip()
-
-            annotated_transcript.append(f"[{start:.2f}] {speaker_label}: {transcription}")
-
+            annotated_transcript.append(f"[{start:.2f}] {speaker_label}: {segment['text']}")
+        
         return annotated_transcript
 
-# ---------------------------------------------------------------------------
-# Removed local TextToSpeechConverter – now handled by external FastAPI service
-# ---------------------------------------------------------------------------
+class TextToSpeechConverter:
+    def __init__(self, model_path, config_path):
+        self.synthesizer = Synthesizer(model_path, config_path)
+
+    def convert_and_save(self, conversation, output_file="./processed_data/speech_outputs/combined_speech.wav"):
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        combined_wavs = []
+        for line in conversation:
+            # Remove speaker label
+            text = line.split(': ', 1)[-1]
+            # Convert text to speech
+            wavs = self.synthesizer.tts(text)
+            combined_wavs.append(wavs)
+        # Concatenate all wavs
+        combined_wav = np.concatenate(combined_wavs)
+        # Save the combined audio file
+        self.synthesizer.save_wav(combined_wav, output_file)
+
 
 if __name__ == "__main__":
     # Example usage
@@ -205,16 +197,7 @@ if __name__ == "__main__":
     text = converter.convert()
     print(text)
 
-    # -------------------------------------------------------------------
-    # Send text to external TTS API (assumes API running at localhost:8000)
-    # -------------------------------------------------------------------
-    try:
-        response = requests.post(
-            "http://localhost:8000/tts",
-            json={"text": text},  # ✅ send correct key
-            timeout=60,
-        )
-        response.raise_for_status()
-        print("Generated speech file:", response.json().get("file_path"))
-    except requests.exceptions.RequestException as err:
-        print("[TTS API] Error:", err)
+    # Initialize TextToSpeechConverter
+    tts_converter = TextToSpeechConverter("./models/best_model_30824.pth", "./models/config.json")
+    # Convert text to speech
+    tts_converter.convert_and_save(text.split("\n")) 
